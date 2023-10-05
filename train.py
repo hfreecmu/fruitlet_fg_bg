@@ -16,9 +16,9 @@ torch.backends.cudnn.enabled = False
 
 def train(opt):
     #get dataloaders
-    train_dataloader = get_data_loader(opt.annotations_dir, opt.seg_dir,
+    train_dataloader = get_data_loader(opt.annotations_dir, opt.seg_dir, opt.disp_dir,
                                        True, opt.batch_size, opt.shuffle)
-    val_dataloader = get_data_loader(opt.val_dir, opt.seg_dir,
+    val_dataloader = get_data_loader(opt.val_dir, opt.seg_dir, opt.disp_dir,
                                        False, 1, False)
     #
 
@@ -139,18 +139,19 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--annotations_dir', required=True)
     parser.add_argument('--seg_dir', required=True)
+    parser.add_argument('--disp_dir', required=True)
     parser.add_argument('--val_dir', required=True)
     parser.add_argument('--params_path', default='./params/default_params.yml')
 
     parser.add_argument('--checkpoint_dir', default='./checkpoints')
 
     parser.add_argument('--num_epochs', type=int, default=200)
-    parser.add_argument('--milestones', type=list, default=[20, 40, 100])
+    parser.add_argument('--milestones', type=list, default=[60, 100])
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--gamma', type=float, default=0.1)
-    parser.add_argument('--pos_weight', type=float, default=3.0)
+    parser.add_argument('--pos_weight', type=float, default=2.0)
 
     parser.add_argument('--log_steps', type=int, default=10)
     parser.add_argument('--fg_thresh', type=float, default=0.5)

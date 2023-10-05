@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 
 def infer(opt):
     #get dataloader
-    dataloader = get_data_loader(opt.annotations_dir, opt.seg_dir,
+    dataloader = get_data_loader(opt.annotations_dir, opt.seg_dir, opt.disp_dir,
                                  False, 1, False)
     #
 
@@ -79,6 +79,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--annotations_dir', required=True)
     parser.add_argument('--seg_dir', required=True)
+    parser.add_argument('--disp_dir', required=True)
 
     parser.add_argument('--params_path', default='./params/default_params.yml')
 

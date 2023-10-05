@@ -22,6 +22,15 @@ SEG_MODEL_PATH='/home/frc-ag-3/harry_ws/fruitlet_2023/labelling/segmentation/tur
 #TODO this is temporary
 TEMP_IMAGE_DIR='/home/frc-ag-3/harry_ws/fruitlet_2023/labelling/inhand/fg_bg_images_real'
 
+#TODO BILATERAL FILTER DISPARITIES???
+
+DISP_MEAN = 165.2707
+DISP_STD = 104.31171
+ROW_MEAN = 539.5
+ROW_STD  = 311.76901171647364
+COL_MEAN = 719.5
+COL_STD = 415.69209358209673
+
 def detect_aprilttag(detector, im_path, tag_id):
     im = cv2.imread(im_path)
     gray_image = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
@@ -85,7 +94,7 @@ def merge_annotations(box_annotations, box_segmentations, tag_corners, tag_seg_i
     
     return annotations, segmentations
 
-def get_boxes(annotations, segmentations, augment, 
+def get_boxes(annotations, segmentations, disparities, augment, 
               width, height, resize, file_id, 
               score_thresh,
               max_shift=5,
@@ -104,8 +113,11 @@ def get_boxes(annotations, segmentations, augment,
     #get normalized rows and cols
     #TODO could be done once
     rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
-    rows = 2*(rows / rows.max()) - 1
-    cols = 2*(cols / cols.max()) - 1
+    #rows = 2*(rows / rows.max()) - 1
+    #cols = 2*(cols / cols.max()) - 1
+    rows = (rows - ROW_MEAN) / ROW_STD
+    cols = (cols - COL_MEAN) / COL_STD
+    disparities = (disparities - DISP_MEAN) / DISP_STD
 
     #augment by shuffling inds
     if augment:
@@ -191,8 +203,9 @@ def get_boxes(annotations, segmentations, augment,
         box_rows = rows[y0:y1, x0:x1]
         box_cols = cols[y0:y1, x0:x1]
         box_seg = box_seg_im[y0:y1, x0:x1]
+        box_disp = disparities[y0:y1, x0:x1]
 
-        keypoint_vec = np.stack([box_rows, box_cols, box_seg])
+        keypoint_vec = np.stack([box_rows, box_cols, box_seg, box_disp])
         keypoint_vec = torch.from_numpy(keypoint_vec).float()
         keypoint_vec = resize(keypoint_vec)
 
@@ -295,14 +308,8 @@ def rand_flip(descs, kpts):
         #box descriptors we fliplr
         descs = torch.fliplr(descs)
 
-        #keypoints for rows unaffected
-
-        #keypoints, for columns we normally would do width - x ...
-        #BUT because cols are between -1 and 1, we just negate it
-        kpts[:, 1, :, :] = -kpts[:, 1, :, :]
-
-        #box segmentations are also flipped left and right
-        kpts[:, 2:3] = torch.fliplr(kpts[:, 2:3])
+        #also fliplr keypoints
+        kpts = torch.fliplr(kpts)
 
     return descs, kpts
 
@@ -316,11 +323,12 @@ def warp_points(points, H):
     return perspective_points
 
 class FgBgDataset(Dataset):
-    def __init__(self, annotatons_dir, segmentations_dir, augment,
+    def __init__(self, annotatons_dir, segmentations_dir, disp_dir, augment,
                  width=1440, height=1080, resize_size=128, score_thresh=0.4,
                  model_path=SEG_MODEL_PATH, device='cuda'):
         self.annotation_paths = self.get_paths(annotatons_dir)
         self.segmentations_dir = segmentations_dir
+        self.disp_dir = disp_dir
         self.augment = augment
         self.width = width
         self.height = height
@@ -355,6 +363,8 @@ class FgBgDataset(Dataset):
         basename = os.path.basename(annotation_path).replace('.json', '')
         seg_path = os.path.join(self.segmentations_dir, basename + '.pkl')
         segmentations = read_pickle(seg_path)
+        disp_path = os.path.join(self.disp_dir, basename + '.npy')
+        disparities = np.load(disp_path)
 
         tag_id = int(basename.split('_')[0])
 
@@ -371,11 +381,11 @@ class FgBgDataset(Dataset):
 
             if np.random.uniform() < 0.5:
                 if np.random.uniform() < 0.5:
-                    image, annotations, segmentations = self.augment_affine(image, annotations, segmentations)
+                    image, disparities, annotations, segmentations = self.augment_affine(image, disparities, annotations, segmentations)
                 else:
-                    image, annotations, segmentations = self.augment_perspective(image, annotations, segmentations)
+                    image, disparities, annotations, segmentations = self.augment_perspective(image, disparities, annotations, segmentations)
 
-        boxes, is_tags, keypoint_vecs, scores, detection_indeces, gt_centers, is_fgs = get_boxes(annotations, segmentations, self.augment, 
+        boxes, is_tags, keypoint_vecs, scores, detection_indeces, gt_centers, is_fgs = get_boxes(annotations, segmentations, disparities, self.augment, 
                                                                                                          self.width, self.height, 
                                                                                                          self.resize, basename, self.score_thresh)
         
@@ -409,8 +419,10 @@ class FgBgDataset(Dataset):
 
         return paths
     
-    def augment_affine(self, image, annotations, segmentations):
+    def augment_affine(self, image, disparities, annotations, segmentations):
         torch_im = torch.from_numpy(image).permute(2, 0, 1)
+        torch_disp = torch.from_numpy(disparities).unsqueeze(0)
+
 
         angle, translations, scale, shear = T.RandomAffine.get_params(self.random_affine.degrees, 
                                                                       self.random_affine.translate,
@@ -464,10 +476,14 @@ class FgBgDataset(Dataset):
         torch_affine_img = F.affine(torch_im, angle, translations, scale, shear)
         affine_img = torch_affine_img.permute(1, 2, 0).numpy()
 
-        return affine_img, warped_annotations, warped_segmentations
+        torch_affine_disp = F.affine(torch_disp, angle, translations, scale, shear)
+        affine_disp = torch_affine_disp.squeeze(0).numpy()
+
+        return affine_img, affine_disp, warped_annotations, warped_segmentations
     
-    def augment_perspective(self, image, annotations, segmentations):
+    def augment_perspective(self, image, disparities, annotations, segmentations):
         torch_im = torch.from_numpy(image).permute(2, 0, 1)
+        torch_disp = torch.from_numpy(disparities).unsqueeze(0)
         
         start_points, end_points = T.RandomPerspective.get_params(torch_im.shape[-1], 
                                                                   torch_im.shape[-2], 
@@ -517,8 +533,12 @@ class FgBgDataset(Dataset):
         torch_perspective_img = F.perspective(torch_im, start_points, 
                                               end_points)
         perspective_img = torch_perspective_img.permute(1, 2, 0).numpy()
+
+        torch_perspective_disp = F.perspective(torch_disp, start_points, 
+                                              end_points)
+        perspective_disp = torch_perspective_disp.squeeze(0).numpy()
         
-        return perspective_img, warped_annotations, warped_segmentations
+        return perspective_img, perspective_disp, warped_annotations, warped_segmentations
     
     def aug_brightness(self, image):
         torch_im = torch.from_numpy(image).permute(2, 0, 1)
@@ -531,9 +551,9 @@ def collate_fn(data):
     zipped = zip(data)
     return list(zipped)
 
-def get_data_loader(annotatons_dir, segmentations_dir, augment, 
+def get_data_loader(annotatons_dir, segmentations_dir, disp_dir, augment, 
                     batch_size, shuffle):
-    dataset = FgBgDataset(annotatons_dir, segmentations_dir, augment)
+    dataset = FgBgDataset(annotatons_dir, segmentations_dir, disp_dir, augment)
     dloader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
 
     return dloader
