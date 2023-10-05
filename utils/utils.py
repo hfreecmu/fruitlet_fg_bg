@@ -4,6 +4,11 @@ import pickle
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import yaml
+import cv2
+
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
 
 #read json
 def read_dict(path):
@@ -11,10 +16,22 @@ def read_dict(path):
         data = json.load(f)
     return data
 
+#read yaml file
+def read_yaml(path):
+    with open(path, 'r') as f:
+        yaml_to_read = yaml.safe_load(f)
+                                
+    return yaml_to_read
+
 #read pkl file
 def read_pickle(path):
     with open(path, "rb") as f:
         return pickle.load(f)
+    
+#write_pickle
+def write_pickle(path, data):
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
     
 #save model checkpoint
 def save_checkpoint(epoch, checkpoint_dir, model):
@@ -26,14 +43,18 @@ def load_checkpoint(epoch, checkpoint_dir, model):
     model_path = os.path.join(checkpoint_dir, 'epoch_%d.pth' % epoch)
     model.load_state_dict(torch.load(model_path))
 
+#read model params
+def read_model_params(params_path):
+    params = read_yaml(params_path)
+    return params
+
 #plot and save scores
-def plot_and_save_scores(checkpoint_dir, epochs, precisions, recalls, f1_scores):
+def plot_and_save_scores(checkpoint_dir, epochs, precisions, recalls):
     epochs = np.array(epochs)
     precisions = np.array(precisions)
     recalls = np.array(recalls)
-    f1_scores = np.array(f1_scores)
 
-    scores = np.vstack((epochs, precisions, recalls, f1_scores))
+    scores = np.vstack((epochs, precisions, recalls))
     scores_np_path = os.path.join(checkpoint_dir, 'scores.npy')
     np.save(scores_np_path, scores)
 
@@ -41,7 +62,6 @@ def plot_and_save_scores(checkpoint_dir, epochs, precisions, recalls, f1_scores)
 
     plt.plot(epochs, precisions, 'b')
     plt.plot(epochs, recalls, 'r')
-    plt.plot(epochs, f1_scores, 'g')
     plt.savefig(scoress_plt_plath)
 
     plt.clf()
@@ -65,62 +85,97 @@ def plot_and_save_loss(checkpoint_dir, epochs, losses, is_train):
 
     plt.clf()
 
-#pass through network
-def predict(classifier, cloud_path, label_path, opt, shuffle, augment):
-    np_clouds, tag_np_cloud = read_pickle(cloud_path)
-    gt_labels = read_dict(label_path)
+#create feature pred cfg
+def create_cfg(model_file, score_thresh):
+    cfg = get_cfg()
+    cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml"))
+    cfg.MODEL.WEIGHTS = model_file 
+    cfg.MODEL.ANCHOR_GENERATOR.SIZES = [[16, 32, 64, 128]]
+    cfg.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0, 2.0]]
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
+
+    cfg.INPUT.MIN_SIZE_TEST = 1080
+    cfg.INPUT.MAX_SIZE_TEST = 1440
+
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = score_thresh
+
+    return cfg
+
+#evaluate matches
+def evaluate_matches(preds, is_fgs, fg_thresh):
+    preds = preds.detach().cpu().numpy().reshape((-1))
+    is_fgs = is_fgs.detach().cpu().numpy().reshape((-1))
+
+    if not preds.shape == is_fgs.shape:
+        raise RuntimeError('Why shapes do not match')
+
+    tp = 0
+    fp = 0
+    fn = 0
+
+    for i in range(preds.shape[0]):
+        pred = preds[i]
+        is_fg = is_fgs[i]
+
+        if is_fg > fg_thresh:
+            if pred > fg_thresh:
+                tp += 1
+            else:
+                fn += 1
+        elif pred > fg_thresh:
+            fp += 1
+
+    return tp, fp, fn
+
+def vis_fg_bg(preds, is_fgs, image_path, gt_centers, fg_thresh, vis_radius, output_path):
     
-    torch_clouds = []
-    is_tag = []
-    target = []
+    im = cv2.imread(image_path)
+    preds = preds.detach().cpu().numpy().reshape((-1))
+    is_fgs = is_fgs.detach().cpu().numpy().reshape((-1))
 
-    for cloud_ind in range(len(np_clouds)):
-        np_cloud = np_clouds[cloud_ind]
+    if not preds.shape == is_fgs.shape:
+        raise RuntimeError('Why shapes do not match')
+    
+    for i in range(preds.shape[0]):
+        pred = preds[i]
+        is_fg = is_fgs[i]
 
-        if np_cloud.shape[0] < opt.min_area:
+        if pred < fg_thresh:
             continue
 
-        cloud_inds = np.random.choice(np_cloud.shape[0], size=opt.min_area, replace=False)
-        np_cloud = np_cloud[cloud_inds]
+        if is_fg < fg_thresh:
+            color = [0, 0, 255]
+        else:
+            color = [0, 255, 0]
 
-        gt_val = gt_labels[cloud_ind][-1] * 1.0
+        y0, x0 = gt_centers[i]
+        cv2.circle(im, (int(x0), int(y0)), vis_radius, color, -1)
 
-        torch_cloud = torch.from_numpy(np_cloud).float()
-        torch_cloud = torch_cloud.unsqueeze(0)
-        torch_cloud = torch_cloud.permute(0, 2, 1)
-        torch_cloud = torch_cloud.to(opt.device)
-        
-        torch_clouds.append(torch_cloud)
-        is_tag.append(0.0)
-        target.append(gt_val)
+    cv2.imwrite(output_path, im)
 
-    torch_tag_cloud = torch.from_numpy(tag_np_cloud).float()
-    torch_tag_cloud = torch_tag_cloud.unsqueeze(0)
-    torch_tag_cloud = torch_tag_cloud.permute(0, 2, 1)
-    torch_tag_cloud = torch_tag_cloud.to(opt.device)
-    torch_clouds.append(torch_tag_cloud)
-    is_tag.append(1.0)
-    target.append(False)
+def plot_metrics(output_dir, precisions, recalls, match_thresholds):
+    comb_path = os.path.join(output_dir, 'metrics.png')
+    comp_np_path = comb_path.replace('.png', '.npy')
 
-    ###shuffle
-    if shuffle:
-        num_nodes = len(torch_clouds)
-        rand_inds = np.random.choice(num_nodes, size=num_nodes, replace=False)
-        rand_torch_clouds = []
-        rand_is_tag = []
-        rand_target = []
-        for rand_ind in rand_inds:
-            rand_torch_clouds.append(torch_clouds[rand_ind])
-            rand_is_tag.append(is_tag[rand_ind])
-            rand_target.append(target[rand_ind])
+    f1_scores = [None]*len(precisions)
+    for i in range(len(precisions)):
+        if precisions[i] == 0 or recalls[i] == 0:
+            f1_scores[i] = 0
+        else:
+            f1_scores[i] = 2*precisions[i]*recalls[i] / (precisions[i] + recalls[i])
 
-        torch_clouds = rand_torch_clouds
-        is_tag = rand_is_tag
-        target = rand_target
-    ###
+    plt.plot(match_thresholds, precisions, 'b', label="precision")
+    plt.plot(match_thresholds, recalls, 'r', label="recall")
+    plt.plot(match_thresholds, f1_scores, 'g', label="f1")
+    plt.legend(loc="lower left")
+    plt.xlabel("Matching Thresholds")
+    plt.xticks(np.arange(min(match_thresholds), max(match_thresholds), 0.1))
+    plt.savefig(comb_path)
 
-    is_tag = torch.as_tensor(is_tag, dtype=torch.float, device=opt.device)
-    target = torch.as_tensor(target, dtype=torch.float, device=opt.device)
-    pred = classifier(torch_clouds, is_tag).flatten()
+    plt.clf()
 
-    return pred, is_tag, target
+    comb_np = np.zeros((len(match_thresholds), 3))
+    comb_np[:, 0] = match_thresholds
+    comb_np[:, 1] = precisions
+    comb_np[:, 2] = recalls
+    np.save(comp_np_path, comb_np)

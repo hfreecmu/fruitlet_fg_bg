@@ -1,0 +1,9 @@
+'gnn_params':
+  'num_layer_reps': 6
+  'd_model': 512
+  'dim_feedforward': 2048
+  'num_heads': 8
+  'norm': "instance"
+
+'final_mlp': [64, 8, 1]
+

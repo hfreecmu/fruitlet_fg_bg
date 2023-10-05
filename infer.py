@@ -1,97 +1,94 @@
 import argparse
 import os
 import torch
-import cv2
 from data.dataloader import get_data_loader
+from utils.utils import load_checkpoint, read_model_params, plot_metrics
+from utils.utils import evaluate_matches, evaluate_matches, vis_fg_bg
 from models.fb_bg_classifier import FgBgClassifier
-from utils.utils import load_checkpoint, read_pickle, read_dict
+import numpy as np
+import torch.nn as nn
+
+import warnings
+warnings.filterwarnings("ignore")
+
 
 def infer(opt):
-    dataloader = get_data_loader(opt.cloud_dir, opt.label_dir, 
-                                 1, False)
-    classifier = FgBgClassifier().to(opt.device)
+    #get dataloader
+    dataloader = get_data_loader(opt.annotations_dir, opt.seg_dir,
+                                 False, 1, False)
+    #
 
-    load_checkpoint(opt.checkpoint_epoch, opt.checkpoint_dir, classifier)
-    classifier.eval()
+    #load model
+    model_params = read_model_params(opt.params_path)
+    model = FgBgClassifier(model_params).to(opt.device)
+    load_checkpoint(opt.checkpoint_epoch, opt.checkpoint_dir, model)
+    model.eval()
+    #
+
+    mts = np.arange(1, 11)*0.1
+    #TODO should these be averaged or total
+    tps = [None]*len(mts)
+    fps = [None]*len(mts)
+    fns = [None]*len(mts)
 
     with torch.no_grad():
         for _, data in enumerate(dataloader):
-            cloud_paths, label_paths = data
-            #TODO make this common
-            for data_num in range(len(cloud_paths)):
-                cloud_path = cloud_paths[data_num]
-                label_path = label_paths[data_num]
-                np_clouds, tag_np_cloud = read_pickle(cloud_path)
-                gt_labels = read_dict(label_path)
-                torch_clouds = []
-                is_tag = []
-                target = []
-                boxes = []
-                for cloud_ind in range(len(np_clouds)):
-                    np_cloud = np_clouds[cloud_ind]
-                    gt_val = gt_labels[cloud_ind][-1] * 1.0
-                    if np_cloud.shape[0] < opt.min_area:
-                        continue
-                    torch_cloud = torch.from_numpy(np_cloud).float()
-                    torch_cloud = torch_cloud.unsqueeze(0)
-                    torch_cloud = torch_cloud.permute(0, 2, 1)
-                    torch_cloud = torch_cloud.to(opt.device)
-                    torch_clouds.append(torch_cloud)
+            if not len(data) == 1:
+                raise RuntimeError('Only batch size 1 supported in test')
+            
+            box_features, keypoint_vecs, is_tags, scores, is_fgs, gt_vis = data[0][0]
+            preds = model(box_features, keypoint_vecs, is_tags, scores)
+            preds = nn.functional.sigmoid(preds)
 
-                    is_tag.append(-1.0)
-                    target.append(gt_val)
-                    boxes.append(gt_labels[cloud_ind][0:4])
+            for mt_ind in range(len(mts)):
+                mt = mts[mt_ind]
+                tp, fp, fn = evaluate_matches(preds, is_fgs, mt)
 
-                #TODO shuffle tag ind
-                #TOODO make this common code
-                torch_tag_cloud = torch.from_numpy(tag_np_cloud).float()
-                torch_tag_cloud = torch_tag_cloud.unsqueeze(0)
-                torch_tag_cloud = torch_tag_cloud.permute(0, 2, 1)
-                torch_tag_cloud = torch_tag_cloud.to(opt.device)
-                torch_clouds.append(torch_tag_cloud)
-                is_tag.append(1.0)
-                target.append(False)
-                
-                is_tag = torch.as_tensor(is_tag, dtype=torch.float, device=opt.device)
-                target = torch.as_tensor(target, dtype=torch.float, device=opt.device)
-                pred = classifier(torch_clouds, is_tag).flatten()
+                if tps[mt_ind] == None:
+                    tps[mt_ind] = []
+                    fps[mt_ind] = []
+                    fns[mt_ind] = []
+                     
+                tps[mt_ind].append(tp)
+                fps[mt_ind].append(fp)
+                fns[mt_ind].append(fn)
 
-                pred = pred[is_tag <= 0]
+            _, gt_centers, image_path, basename = gt_vis
+            output_path = os.path.join(opt.vis_dir, basename.replace('.json', '.png'))
+            vis_fg_bg(preds, is_fgs, image_path, gt_centers, opt.vis_fg_thresh, opt.vis_radius, output_path)
+            
+    precisions = [None]*len(mts)
+    recalls = [None]*len(mts)
+    for mt_ind in range(len(mts)):
+        tps_sum = np.sum(tps[mt_ind])
+        if tps_sum == 0:
+            precisions[mt_ind] = 0
+            recalls[mt_ind] = 0
+        else:
+            precisions[mt_ind] = tps_sum / (tps_sum + np.sum(fps[mt_ind]))
+            recalls[mt_ind] = tps_sum / (tps_sum + np.sum(fns[mt_ind]))
 
-                image_path = os.path.join(opt.image_dir, 
-                                          os.path.basename(label_path).replace('.json', 
-                                                                               '.png'))                
-                im = cv2.imread(image_path)
-                for node_ind in range(pred.shape[0]):
-                    if pred[node_ind].item() > 0:
-                        color = [0, 0, 255]
-                    else:
-                        color = [0, 255, 0]
+        precisions[mt_ind] = np.mean(precisions[mt_ind]) 
+        recalls[mt_ind] = np.mean(recalls[mt_ind]) 
 
-                    x0, y0, x1, y1 = boxes[node_ind]
+    plot_metrics(opt.vis_dir, precisions, recalls, mts)
 
-                    cv2.rectangle(im, (int(x0), int(y0)), (int(x1), int(y1)), color, vis_thickness)
-
-                output_path = os.path.join(opt.vis_dir, 
-                                           os.path.basename(image_path))
-                
-                cv2.imwrite(output_path, im)
-
-
-vis_thickness = 2
 default_image_dir = '/home/frc-ag-3/harry_ws/fruitlet_2023/labelling/inhand/fg_bg_images'
 def parse_args():
     """Parse input arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cloud_dir', required=True)
-    parser.add_argument('--label_dir', required=True)
+    parser.add_argument('--annotations_dir', required=True)
+    parser.add_argument('--seg_dir', required=True)
+
+    parser.add_argument('--params_path', default='./params/default_params.yml')
 
     parser.add_argument('--checkpoint_dir', default='./checkpoints')
     parser.add_argument('--checkpoint_epoch', type=int, required=True)
+
     parser.add_argument('--vis_dir', default='./vis')
     parser.add_argument('--image_dir', default=default_image_dir)
-
-    parser.add_argument('--min_area', type=int, default=50)
+    parser.add_argument('--vis_radius', type=int, default=2)
+    parser.add_argument('--vis_fg_thresh', type=float, default=0.8)
 
     parser.add_argument('--device', default='cuda')
     
