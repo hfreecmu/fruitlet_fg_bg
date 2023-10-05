@@ -1,8 +1,6 @@
 import torch.nn as nn
 import torch
 
-from models.pointnet import PointNetfeat
-
 ### mlp
 def fc(in_dim, out_dims):
     layers = []
@@ -35,26 +33,50 @@ class MLP(nn.Module):
 
 class FgBgClassifier(nn.Module):
     def __init__(self):
-        
+
         super(FgBgClassifier, self).__init__()
-        self.pointnet_feat = PointNetfeat(global_feat=True, feature_transform=False)
-        self.gnn = torch.nn.Transformer(d_model=512, num_encoder_layers=1, dim_feedforward=512, 
+        self.cloud_mlp = MLP(4, [64, 256, 512])
+        self.cloud_gnn = torch.nn.Transformer(d_model=512, num_encoder_layers=3, dim_feedforward=512, 
+                                              batch_first=True).encoder
+        self.pos_enc_mlp = MLP(4, [64, 256, 512])
+        
+        self.gnn = torch.nn.Transformer(d_model=512, num_encoder_layers=2, dim_feedforward=512, 
                                         batch_first=True).encoder
-        self.mlp = MLP(512, [64, 1])
+        self.mlp = MLP(512, [64, 8, 1])
 
     #clouds is list of [1 x 3 x n]
     def forward(self, clouds, is_tag):
-        cloud_features = []
-        for cloud in clouds:
-            cloud_feature, _, _ = self.pointnet_feat(cloud)
-            cloud_features.append(cloud_feature)
+        #step 1) get centroid of all cloud for offset
+        full_centroid = torch.concatenate(clouds, dim=-1).mean(dim=(0,2))
 
+        #step 2) transform each cloud
+        cloud_features = []
+        cloud_centroids = []
+        for i in range(len(clouds)):
+            cloud = clouds[i]
+            cloud_centroid = cloud.mean(dim=(0,2))
+            centered_cloud = cloud - cloud_centroid.reshape((1, 3, -1))
+            tag_feature = torch.ones((1, 1, centered_cloud.shape[-1])).float().to(cloud_centroid.device)*is_tag[i]
+            cloud_feature = torch.concatenate((centered_cloud, tag_feature), dim=1)
+            cloud_feature = torch.permute(cloud_feature, (0, 2, 1))
+            cloud_feature = self.cloud_mlp(cloud_feature.squeeze(0)).unsqueeze(0)
+            cloud_feature = self.cloud_gnn(cloud_feature)
+            cloud_feature = torch.max(cloud_feature, 1, keepdim=True)[0][:, 0, :]
+
+            cloud_features.append(cloud_feature)
+            cloud_centroids.append(cloud_centroid - full_centroid)
+        
+        #step 3) get positional encoding
+        cloud_centroids = torch.stack(cloud_centroids)
+        cloud_centroids = torch.concatenate((cloud_centroids, is_tag.reshape((-1, 1))), dim=-1)
+        pos_enc = self.pos_enc_mlp(cloud_centroids)
+
+        #step 4) add positional encoding and cloud features
         cloud_features = torch.concatenate(cloud_features)
 
-        #TODO confirm this does not kill gradients
-        cloud_features = torch.concatenate((cloud_features, is_tag.reshape(is_tag.shape[0], -1)), dim=-1)
-        
-        cloud_features = self.gnn(cloud_features)
-        is_fg = self.mlp(cloud_features)
+        x = cloud_features + pos_enc
+        x = x.unsqueeze(0)
+        x = self.gnn(x)
+        is_fg = self.mlp(x.squeeze(0))
         
         return is_fg
