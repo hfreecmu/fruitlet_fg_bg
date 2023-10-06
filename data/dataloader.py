@@ -54,23 +54,23 @@ def merge_annotations(box_annotations, box_segmentations, tag_corners, tag_seg_i
     annotations = []
     segmentations = []
 
-    tag_x0 = np.min(tag_corners[:, 0])
-    tag_x1 = np.max(tag_corners[:, 0])
-    tag_y0 = np.min(tag_corners[:, 1])
-    tag_y1 = np.max(tag_corners[:, 1])
+    # tag_x0 = np.min(tag_corners[:, 0])
+    # tag_x1 = np.max(tag_corners[:, 0])
+    # tag_y0 = np.min(tag_corners[:, 1])
+    # tag_y1 = np.max(tag_corners[:, 1])
 
-    annotations.append({
-        "x0": tag_x0,
-        "x1": tag_x1,
-        "y0": tag_y0,
-        "y1": tag_y1,
-        "is_tag": True,
-        "score": 0.99,
-        "is_fg": False,
-        "orig_index": -1
-    })
+    # annotations.append({
+    #     "x0": tag_x0,
+    #     "x1": tag_x1,
+    #     "y0": tag_y0,
+    #     "y1": tag_y1,
+    #     "is_tag": True,
+    #     "score": 0.99,
+    #     "is_fg": False,
+    #     "orig_index": -1
+    # })
 
-    segmentations.append(tag_seg_inds)
+    # segmentations.append(tag_seg_inds)
 
     if not len(box_annotations) == len(box_segmentations):
         raise RuntimeError('mismatch box annotations and box segmentations')
